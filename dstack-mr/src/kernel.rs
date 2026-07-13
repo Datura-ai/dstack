@@ -211,15 +211,26 @@ fn patch_kernel(
     Ok(kd)
 }
 
-/// Measures a QEMU-patched TDX kernel image.
+/// Measures a direct-boot TDX kernel image.
+///
+/// `patch_setup_header` selects the QEMU generation: QEMU < 10 rewrites the
+/// bzImage setup header (type_of_loader, loadflags, cmdline/initrd addresses)
+/// before exposing the image via fw_cfg, so the firmware measures the patched
+/// image; QEMU >= 10 stopped patching the header for measured direct boot and
+/// measures the RAW bzImage.
 pub(crate) fn rtmr1_log(
     kernel_data: &[u8],
     initrd_size: u32,
     mem_size: u64,
     acpi_data_size: u32,
+    patch_setup_header: bool,
 ) -> Result<Vec<Vec<u8>>> {
-    let kd = patch_kernel(kernel_data, initrd_size, mem_size, acpi_data_size)
-        .context("Failed to patch kernel")?;
+    let kd = if patch_setup_header {
+        patch_kernel(kernel_data, initrd_size, mem_size, acpi_data_size)
+            .context("Failed to patch kernel")?
+    } else {
+        kernel_data.to_vec()
+    };
     let kernel_hash = authenticode_sha384_hash(&kd).context("Failed to compute kernel hash")?;
     Ok(vec![
         kernel_hash,
