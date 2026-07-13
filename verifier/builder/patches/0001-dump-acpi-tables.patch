@@ -1,0 +1,366 @@
+Subject: [PATCH] dstack-acpi-tables: offline ACPI dump for QEMU 10.2.1 (Canonical)
+
+Provenance
+==========
+Derived from kvinwang/qemu-tdx@dbcec07c ("Dump ACPI tables", the QEMU_REV the
+9.2.1 oracle built) and SCOPED to the offline, VM-less ACPI dump for building
+`dstack-acpi-tables` from Canonical Ubuntu 26.04 `qemu 1:10.2.1+ds-1ubuntu3.1`
+source (`apt-get source qemu`).
+
+What was KEPT (all guarded by `#ifdef DUMP_ACPI_TABLES`):
+  - hardcoded machine constants matching the dstack TD launch config:
+      PM I/O base 0x600, sci_int 9, GPE0 = io+0x20, PCI holes
+      (below_4g..0xfec00000 / 0x380000000000), MCFG base 0xe0000000
+  - dump-and-exit in acpi_setup(): writes tables.table_data (== etc/acpi/tables)
+    to stdout and exit(0). rsdp + table-loader are re-derived in Rust
+    (dstack-mr/src/acpi.rs::build_tables), so only table_data is dumped.
+  - hardware-bypass shims so the dump runs in a container with no TDX/GPU/vsock:
+      vfio/pci.c early-return, vhost-vsock.c -> /dev/zero + skip init,
+      hostmem.c skip mbind, physmem.c 20MB cap + anon RAM + guest_memfd guard,
+      pc.c skip phys-bits check, x86-common.c instantiate 1 vCPU,
+      acpi-common.c force MADT cpu entries enabled.
+
+What was DROPPED vs the 9.2.1 patch (and WHY):
+  - The `QEMU_ACPI_COMPAT_VER` / acpi_dump_compat_9_1() version-dispatch
+    machinery (acpi-compat.c, the aml_pci_pdsm / build_link_dev /
+    build_gsi_link_dev / build_iqcr_method / build_piix4_pci0_int compat
+    rewrites, hw/i386/meson.build, tests/unit/test-acpi-compat.c). That path is
+    only taken when QEMU_ACPI_COMPAT_VER < 9.2.0; a native 10.2.1 binary sets
+    it to 10.2.1, so it is ALWAYS the "else" branch == native 10.2.1 behaviour.
+    Verified: 10.2.1 acpi-build.c interrupt links already emit AML_LEVEL and
+    acpi-common.c MADT already emits the Active-High/Level (0xd) xrupt override,
+    i.e. exactly the compat "else" branch. So dropping it changes ZERO emitted
+    bytes and makes QEMU_ACPI_COMPAT_VER inert (per the approved ADR).
+
+Ports NEW for 10.2.1 (regions the 9.2.1 patch did not touch):
+  - system/physmem.c guest_memfd: 10.2.1 REFACTORED the block — the old
+    `assert(kvm_enabled())` became `if (!kvm_enabled()) { error_setg(...KVM
+    required); goto out_free; }`, which would now hard-error under the KVM-less
+    dump. Replacement: wrap the whole `if (flags & RAM_GUEST_MEMFD)` body in
+    `#ifndef DUMP_ACPI_TABLES` (ACPI tables do not depend on the RAM backing).
+  - target/i386/kvm/tdx.c tdx_cpu_instance_init(): 10.2.1 ADDED a hard check
+    `if (xcc->model) { error_report("Named cpu model is not supported for TDX
+    yet!"); exit(1); }`. The oracle deliberately uses `-cpu qemu64` (a CPU-model-
+    independent placeholder — the ACPI tables do not depend on the CPU model,
+    which is why the 9.2.1 oracle matches the `-cpu host` real host). The check
+    is `#ifndef DUMP_ACPI_TABLES`-guarded so qemu64 is accepted for the dump;
+    the following pmu/invtsc/force_cpuid_0x1f setup only touches CPU features,
+    never the ACPI tables.
+
+Constant re-validation (A1): the 5 hardcoded constants are unchanged from the
+proven 9.2.1 oracle. 10.2.1's ICH9 PM model and q35 pciexbar property are
+architecturally intact. MCFG base 0xe0000000 is dstack-config-specific
+(!= q35 default 0xb0000000) and its correctness for 10.2.1 is confirmed by the
+[H] RTMR0/MRTD byte-equality (Phase F), not offline.
+
+Applies clean (fuzz=0) to `apt-get source qemu=1:10.2.1+ds-1ubuntu3.1`.
+---
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/backends/hostmem.c work/qemu-dump/backends/hostmem.c
+--- a/backends/hostmem.c	2026-02-12 23:45:56.000000000 -0500
++++ b/backends/hostmem.c	2026-07-10 02:05:01.530538852 -0400
+@@ -408,6 +408,9 @@
+     }
+ #endif
+ 
++#ifdef DUMP_ACPI_TABLES
++    (void)flags;
++#else
+     if (maxnode &&
+         mbind(ptr, sz, mode, backend->host_nodes, maxnode + 1, flags)) {
+         if (backend->policy != MPOL_DEFAULT || errno != ENOSYS) {
+@@ -417,6 +420,7 @@
+         }
+     }
+ #endif
++#endif
+     /*
+      * Preallocate memory after the NUMA policy has been instantiated.
+      * This is necessary to guarantee memory is allocated with
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/hw/i386/acpi-build.c work/qemu-dump/hw/i386/acpi-build.c
+--- a/hw/i386/acpi-build.c	2026-02-12 23:45:57.000000000 -0500
++++ b/hw/i386/acpi-build.c	2026-07-10 02:05:01.530538852 -0400
+@@ -143,7 +143,11 @@
+      */
+     bool smm_enabled = object_property_get_bool(o, "smm-compat", NULL) ?
+         true : x86_machine_is_smm_enabled(x86ms);
++#ifdef DUMP_ACPI_TABLES
++    uint32_t io = 0x600;
++#else
+     uint32_t io = object_property_get_uint(o, ACPI_PM_PROP_PM_IO_BASE, NULL);
++#endif
+     AmlAddressSpace as = AML_AS_SYSTEM_IO;
+     AcpiFadtData fadt = {
+         .rev = 3,
+@@ -164,7 +168,11 @@
+         .plvl2_lat = 0xfff /* C2 state not supported */,
+         .plvl3_lat = 0xfff /* C3 state not supported */,
+         .smi_cmd = smm_enabled ? ACPI_PORT_SMI_CMD : 0,
++#ifdef DUMP_ACPI_TABLES
++        .sci_int = 9,
++#else
+         .sci_int = object_property_get_uint(o, ACPI_PM_PROP_SCI_INT, NULL),
++#endif
+         .acpi_enable_cmd =
+             smm_enabled ?
+             object_property_get_uint(o, ACPI_PM_PROP_ACPI_ENABLE_CMD, NULL) :
+@@ -179,7 +187,11 @@
+         .pm_tmr = { .space_id = as, .bit_width = 4 * 8, .address = io + 0x08 },
+         .gpe0_blk = { .space_id = as, .bit_width =
+             object_property_get_uint(o, ACPI_PM_PROP_GPE0_BLK_LEN, NULL) * 8,
++#ifdef DUMP_ACPI_TABLES
++            .address = io + 0x20
++#else
+             .address = object_property_get_uint(o, ACPI_PM_PROP_GPE0_BLK, NULL)
++#endif
+         },
+     };
+ 
+@@ -295,6 +307,18 @@
+         return;
+     }
+ 
++#ifdef DUMP_ACPI_TABLES
++    {
++        X86MachineState *x86ms = X86_MACHINE(qdev_get_machine());
++        uint64_t hole64_size = object_property_get_uint(pci_host,
++                                               PCI_HOST_PROP_PCI_HOLE64_SIZE,
++                                               NULL);
++        range_set_bounds1(hole, x86ms->below_4g_mem_size, 0xfec00000);
++        range_set_bounds1(hole64, 0x380000000000ULL, 0x380000000000ULL + hole64_size);
++        return;
++    }
++#endif
++
+     range_set_bounds1(hole,
+                       object_property_get_uint(pci_host,
+                                                PCI_HOST_PROP_PCI_HOLE_START,
+@@ -1897,6 +1921,14 @@
+     Object *pci_host;
+     QObject *o;
+ 
++#ifdef DUMP_ACPI_TABLES
++    {
++        mcfg->base = 0xe0000000;
++        mcfg->size = 0x10000000;
++        return true;
++    }
++#endif
++
+     pci_host = acpi_get_i386_pci_host();
+     if (!pci_host) {
+         return false;
+@@ -2172,6 +2204,21 @@
+     },
+ };
+ 
++#ifdef DUMP_ACPI_TABLES
++static void tdx_init(void)
++{
++    MachineState *ms = MACHINE(qdev_get_machine());
++    X86MachineState *x86ms = X86_MACHINE(ms);
++    // ms->require_guest_memfd = true;
++    if (x86ms->smm == ON_OFF_AUTO_AUTO) {
++        x86ms->smm = ON_OFF_AUTO_OFF;
++    }
++    if (x86ms->pic == ON_OFF_AUTO_AUTO) {
++        x86ms->pic = ON_OFF_AUTO_OFF;
++    }
++}
++#endif
++
+ void acpi_setup(void)
+ {
+     PCMachineState *pcms = PC_MACHINE(qdev_get_machine());
+@@ -2184,6 +2231,10 @@
+     static FwCfgTPMConfig tpm_config;
+ #endif
+ 
++#ifdef DUMP_ACPI_TABLES
++    tdx_init();
++#endif
++
+     if (!x86ms->fw_cfg) {
+         ACPI_BUILD_DPRINTF("No fw cfg. Bailing out.\n");
+         return;
+@@ -2204,6 +2255,32 @@
+     acpi_build_tables_init(&tables);
+     acpi_build(&tables, MACHINE(pcms));
+ 
++#ifdef DUMP_ACPI_TABLES
++    {
++        uint8_t *ptr = (uint8_t *)tables.table_data->data;
++        uint64_t size = tables.table_data->len;
++        int flags = fcntl(1, F_GETFL);
++        if (flags < 0) {
++            perror("fcntl");
++            exit(1);
++        }
++        if (fcntl(1, F_SETFL, flags & ~O_NONBLOCK) < 0) {
++            perror("fcntl");
++            exit(1);
++        }
++
++        while (size > 0) {
++            int ret = write(1, ptr, size);
++            if (ret < 0) {
++                fprintf(stderr, "Failed to write ACPI table, ret=%d\n", ret);
++                exit(1);
++            }
++            ptr += ret;
++            size -= ret;
++        }
++        exit(0);
++    }
++#endif
+     /* Now expose it all to Guest */
+     build_state->table_mr = acpi_add_rom_blob(acpi_build_update,
+                                               build_state, tables.table_data,
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/hw/i386/acpi-common.c work/qemu-dump/hw/i386/acpi-common.c
+--- a/hw/i386/acpi-common.c	2026-02-12 23:45:57.000000000 -0500
++++ b/hw/i386/acpi-common.c	2026-07-10 02:05:29.421261232 -0400
+@@ -112,7 +112,14 @@
+                               x86ms->pic != ON_OFF_AUTO_OFF ? 1 : 0 , 4);
+ 
+     for (i = 0; i < apic_ids->len; i++) {
++#ifdef DUMP_ACPI_TABLES
++        /* offline ACPI dump: force every MADT CPU entry enabled so the dumped
++         * APIC table matches a fully-populated live TD (only 1 vCPU is actually
++         * instantiated under the dump, see x86_cpus_init). */
++        pc_madt_cpu_entry(i, apic_ids, table_data, true);
++#else
+         pc_madt_cpu_entry(i, apic_ids, table_data, false);
++#endif
+         if (apic_ids->cpus[i].arch_id > 254) {
+             x2apic_mode = true;
+         }
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/hw/i386/pc.c work/qemu-dump/hw/i386/pc.c
+--- a/hw/i386/pc.c	2026-07-10 01:56:10.000000000 -0400
++++ b/hw/i386/pc.c	2026-07-10 02:05:01.530538852 -0400
+@@ -891,11 +891,14 @@
+      */
+     maxusedaddr = pc_max_used_gpa(pcms, pci_hole64_size);
+     maxphysaddr = ((hwaddr)1 << cpu->phys_bits) - 1;
++
+     if (maxphysaddr < maxusedaddr) {
++#ifndef DUMP_ACPI_TABLES
+         error_report("Address space limit 0x%"PRIx64" < 0x%"PRIx64
+                      " phys-bits too low (%u)",
+                      maxphysaddr, maxusedaddr, cpu->phys_bits);
+         exit(EXIT_FAILURE);
++#endif
+     }
+ 
+     /*
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/hw/i386/x86-common.c work/qemu-dump/hw/i386/x86-common.c
+--- a/hw/i386/x86-common.c	2026-02-12 23:45:57.000000000 -0500
++++ b/hw/i386/x86-common.c	2026-07-10 02:05:01.530538852 -0400
+@@ -112,6 +112,9 @@
+ 
+     possible_cpus = mc->possible_cpu_arch_ids(ms);
+     for (i = 0; i < ms->smp.cpus; i++) {
++#ifdef DUMP_ACPI_TABLES
++        if (i > 0) break;
++#endif
+         x86_cpu_new(x86ms, possible_cpus->cpus[i].arch_id, &error_fatal);
+     }
+ }
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/hw/vfio/pci.c work/qemu-dump/hw/vfio/pci.c
+--- a/hw/vfio/pci.c	2026-02-12 23:45:57.000000000 -0500
++++ b/hw/vfio/pci.c	2026-07-10 02:05:01.530538852 -0400
+@@ -3401,6 +3401,9 @@
+     char uuid[UUID_STR_LEN];
+     g_autofree char *name = NULL;
+ 
++#ifdef DUMP_ACPI_TABLES
++    return;
++#endif
+     if (vbasedev->fd < 0 && !vbasedev->sysfsdev) {
+         if (!(~vdev->host.domain || ~vdev->host.bus ||
+               ~vdev->host.slot || ~vdev->host.function)) {
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/hw/virtio/vhost-vsock.c work/qemu-dump/hw/virtio/vhost-vsock.c
+--- a/hw/virtio/vhost-vsock.c	2026-02-12 23:45:57.000000000 -0500
++++ b/hw/virtio/vhost-vsock.c	2026-07-10 02:05:01.530538852 -0400
+@@ -151,7 +151,11 @@
+             return;
+         }
+     } else {
++#ifdef DUMP_ACPI_TABLES
++        vhostfd = open("/dev/zero", O_RDWR);
++#else
+         vhostfd = open("/dev/vhost-vsock", O_RDWR);
++#endif
+         if (vhostfd < 0) {
+             error_setg_file_open(errp, errno, "/dev/vhost-vsock");
+             return;
+@@ -164,6 +168,10 @@
+ 
+     vhost_vsock_common_realize(vdev);
+ 
++#ifdef DUMP_ACPI_TABLES
++    return;
++#endif
++
+     ret = vhost_dev_init(&vvc->vhost_dev, (void *)(uintptr_t)vhostfd,
+                          VHOST_BACKEND_TYPE_KERNEL, 0, errp);
+     if (ret < 0) {
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/system/physmem.c work/qemu-dump/system/physmem.c
+--- a/system/physmem.c	2026-02-12 23:45:57.000000000 -0500
++++ b/system/physmem.c	2026-07-10 02:05:50.882485069 -0400
+@@ -2188,9 +2188,15 @@
+                 return;
+             }
+         } else {
++#ifdef DUMP_ACPI_TABLES
++            new_block->host = qemu_anon_ram_alloc(MIN(new_block->max_length, 20971520),
++                                                  &new_block->mr->align,
++                                                  shared, noreserve);
++#else
+             new_block->host = qemu_anon_ram_alloc(new_block->max_length,
+                                                   &new_block->mr->align,
+                                                   shared, noreserve);
++#endif
+             if (!new_block->host) {
+                 error_setg_errno(errp, errno,
+                                  "cannot set up guest memory '%s'",
+@@ -2203,6 +2209,7 @@
+         }
+     }
+ 
++#ifndef DUMP_ACPI_TABLES
+     if (new_block->flags & RAM_GUEST_MEMFD) {
+         int ret;
+ 
+@@ -2259,6 +2266,7 @@
+                                       BIT(MIG_MODE_CPR_TRANSFER), errp);
+         }
+     }
++#endif /* DUMP_ACPI_TABLES */
+ 
+     ram_size = (new_block->offset + new_block->max_length) >> TARGET_PAGE_BITS;
+     dirty_memory_extend(ram_size);
+@@ -2405,6 +2413,9 @@
+     bool created;
+     RAMBlock *block;
+ 
++#ifdef DUMP_ACPI_TABLES
++    return qemu_ram_alloc(size, RAM_GUEST_MEMFD, mr, errp);
++#endif
+     fd = file_ram_open(mem_path, memory_region_name(mr),
+                        !!(ram_flags & RAM_READONLY_FD), &created);
+     if (fd < 0) {
+diff -ruN '--exclude=.pc' '--exclude=.git' src/qemu-10.2.1+ds/target/i386/kvm/tdx.c work/qemu-dump/target/i386/kvm/tdx.c
+--- a/target/i386/kvm/tdx.c	2026-02-12 23:45:57.000000000 -0500
++++ b/target/i386/kvm/tdx.c	2026-07-10 02:51:09.356316382 -0400
+@@ -748,10 +748,12 @@
+     X86CPUClass *xcc = X86_CPU_GET_CLASS(cpu);
+     X86CPU *x86cpu = X86_CPU(cpu);
+ 
++#ifndef DUMP_ACPI_TABLES
+     if (xcc->model) {
+         error_report("Named cpu model is not supported for TDX yet!");
+         exit(1);
+     }
++#endif
+ 
+     object_property_set_bool(OBJECT(cpu), "pmu", false, &error_abort);
+ 

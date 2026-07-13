@@ -30,42 +30,70 @@ RUN rustup target add x86_64-unknown-linux-musl
 RUN cd dstack && cargo build --release -p dstack-verifier --target x86_64-unknown-linux-musl
 RUN echo "${DSTACK_REV}" > /build/.GIT_REV
 
-FROM debian:bookworm@sha256:0d8498a0e9e6a60011df39aab78534cfe940785e7c59d19dfae1eb53ea59babe AS acpi-builder
+# dstack-acpi-tables oracle, built from official Canonical Ubuntu 26.04 QEMU
+# source (NOT the kvinwang personal fork). ubuntu:26.04 so the oracle's glibc/ABI
+# matches the TDX host that runs the same apt QEMU package.
+FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e AS acpi-builder
 COPY --from=build-shared pin-packages.sh config-qemu.sh /build/
 COPY builder/shared/qemu-pinned-packages.txt /build/
 WORKDIR /build
-ARG QEMU_REV=dbcec07c0854bf873d346a09e87e4c993ccf2633
+# Canonical Ubuntu 26.04 LTS main-archive QEMU. HARD GATE (N3): the oracle binary
+# MUST be built from the byte-identical package version the TDX host installs.
+# A security bump of this pin (…-1ubuntu3.1 -> …3.2) is a measurement re-baseline
+# trigger — bump host + oracle together and re-run the byte-equality proof.
+ARG QEMU_SRC_VERSION=1:10.2.1+ds-1ubuntu3.1
+# pin-packages.sh points apt at the frozen snapshot.ubuntu.com mirror with deb-src
+# enabled (N1) so `apt-get source qemu` resolves; the explicit, snapshot-pinned dep
+# set below is the proven dstack-oracle minimal set (mirrors the 9.2.1 build) + meson.
+# NOTE: `apt-get build-dep qemu` is intentionally NOT used — it drags in the full
+# cross-compilation toolchain (arm/hppa/i686 gcc) for QEMU's other targets/firmware,
+# none of which a `--target-list=x86_64-softmmu` headless dump build needs. The
+# closure stays fully pinned via pin-packages.sh, so reproducibility is unchanged.
+# qemu-system-data + ipxe-qemu supply the option ROMs byte-identically to the host.
 RUN ./pin-packages.sh ./qemu-pinned-packages.txt && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-    git \
+    ca-certificates \
+    dpkg-dev \
+    patch \
     libslirp-dev \
+    libglib2.0-dev \
+    libpixman-1-dev \
+    libfdt-dev \
     python3-pip \
+    python3-venv \
+    meson \
     ninja-build \
     pkg-config \
-    libglib2.0-dev \
     python3-sphinx \
     python3-sphinx-rtd-theme \
     build-essential \
     flex \
-    bison && \
-    rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
-RUN git clone https://github.com/kvinwang/qemu-tdx.git --depth 1 --branch dstack-qemu-9.2.1 --single-branch && \
-    cd qemu-tdx && git fetch --depth 1 origin ${QEMU_REV} && \
-    git checkout ${QEMU_REV} && \
+    bison \
+    qemu-system-data \
+    ipxe-qemu
+# Patch copied after the apt layer so patch iterations reuse the cached toolchain.
+COPY builder/patches /build/patches
+# Fetch Canonical QEMU source, apply the offline-dump patch, build the oracle.
+# The oracle emits etc/acpi/tables to stdout; rsdp + table-loader are re-derived
+# in Rust (dstack-mr/src/acpi.rs::build_tables).
+RUN apt-get source "qemu=${QEMU_SRC_VERSION}" && \
+    cd qemu-10.2.1+ds && \
+    patch -p1 < /build/patches/0001-dump-acpi-tables.patch && \
     ../config-qemu.sh ./build /usr/local && \
-    cd build && \
-    ninja && \
-    strip qemu-system-x86_64 && \
-    install -m 755 qemu-system-x86_64 /usr/local/bin/dstack-acpi-tables && \
-    cd ../ && \
+    ninja -C build qemu-system-x86_64 && \
+    strip build/qemu-system-x86_64 && \
+    install -m 755 build/qemu-system-x86_64 /usr/local/bin/dstack-acpi-tables && \
     install -d /usr/local/share/qemu && \
-    install -m 644 pc-bios/efi-virtio.rom /usr/local/share/qemu/ && \
-    install -m 644 pc-bios/kvmvapic.bin /usr/local/share/qemu/ && \
-    install -m 644 pc-bios/linuxboot_dma.bin /usr/local/share/qemu/ && \
-    cd .. && rm -rf qemu-tdx
+    install -m 644 /usr/share/qemu/efi-virtio.rom /usr/local/share/qemu/ && \
+    install -m 644 /usr/share/qemu/kvmvapic.bin /usr/local/share/qemu/ && \
+    install -m 644 /usr/share/qemu/linuxboot_dma.bin /usr/local/share/qemu/ && \
+    cd .. && rm -rf qemu-10.2.1+ds && \
+    rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
-FROM debian:bookworm@sha256:0d8498a0e9e6a60011df39aab78534cfe940785e7c59d19dfae1eb53ea59babe
+# Final image on ubuntu:26.04 so the ubuntu-built dstack-acpi-tables oracle's
+# glibc/ABI is satisfied (the musl-static dstack-verifier is base-agnostic).
+FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e
 COPY --from=build-shared pin-packages.sh /build/
 COPY builder/shared/pinned-packages.txt /build/
 WORKDIR /build
@@ -74,8 +102,10 @@ RUN ./pin-packages.sh ./pinned-packages.txt && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    libglib2.0-0 \
+    libglib2.0-0t64 \
     libslirp0 \
+    libpixman-1-0 \
+    libfdt1 \
     && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 COPY --from=verifier-builder /build/dstack/target/x86_64-unknown-linux-musl/release/dstack-verifier /usr/local/bin/dstack-verifier
 COPY --from=verifier-builder /build/.GIT_REV /etc/
